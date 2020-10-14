@@ -31,8 +31,13 @@ import signal
 import select
 from typing import Optional, Sequence, Dict, List
 
-import Xlib.display
-import Xlib.error
+try:
+    import Xlib.display
+    import Xlib.error
+except ImportError as exc:
+    print(f"xwinrestore: python-xlib must be installed before running this program ({exc})",
+          file=sys.stderr)
+    sys.exit(1)
 
 VERSION = '1.0'
 
