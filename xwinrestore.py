@@ -29,7 +29,7 @@ import sys
 import time
 import signal
 import select
-from typing import Optional, Sequence, Dict, List
+from typing import Optional, Sequence, Dict, List, Tuple
 
 try:
     import Xlib.display
@@ -44,7 +44,9 @@ VERSION = '1.0'
 # Default interval for how often to record window positions
 DEFAULT_POLL_INTERVAL = 10  # seconds
 # Time to let the window manager settle things after monitor changes
-SETTLE_INTERVAL = 4  # seconds
+SETTLE_INTERVAL = 3  # seconds
+# Used to calculate the (fictional) physical screen size when mode-setting
+PIXELS_PER_MM = 3.780  # 96dpi / 25.4
 
 DISPLAY: Optional[Xlib.display.Display] = None
 BASE_LOG_LEVEL = logging.WARNING
@@ -122,43 +124,56 @@ class DisplayConfig:
                  root: Optional[Xlib.display.drawable.Window] = None) -> None:
         if root is None:
             root = dply.screen().root
+        self.dply = dply
+        self.root = root
 
         active = []
 
-        log = logging.getLogger('DisplayConfig')
+        self.log = logging.getLogger('DisplayConfig')
 
         resources = root.xrandr_get_screen_resources()._data
+        self.modes = resources['modes']
+        self.preferred_modes: Dict[str, Tuple[int, int]] = {}
+
         config_ts = resources['config_timestamp']
         for output_id in resources['outputs']:
             disp = self._parse_output(dply, output_id, config_ts)
             if disp is None:
                 continue
 
-            active.append(disp)
+            # Extract the preferred mode and store indexed by name
+            self.preferred_modes[disp[0]] = disp[5]
+            active.append(disp[:5])
 
         self.displays = tuple(sorted(active))
-        log.debug('all displays: %s', self)
+        self.log.debug('all displays: %s', self)
 
-    @staticmethod
-    def _parse_output(dply: Xlib.display.Display,
+    def _parse_output(self, dply: Xlib.display.Display,
                       output_id: int, config_ts: int) -> Optional[tuple]:
         output = dply.xrandr_get_output_info(output_id, config_ts)._data
         is_connected = output['connection'] == Xlib.ext.randr.Connected
         if not is_connected:
             return None
 
+        name = output['name']
+
         crtc_id = output['crtc']
         if crtc_id == 0:
             return None
 
-        name = output['name']
+        # Grab the most-preferred mode
+        pref_mode: Tuple[int, int] = (-1, -1)
+        num_preferred = output['num_preferred']
+        if num_preferred > 0:
+            pref_mode = (crtc_id, output['modes'][0])
+
         crtc = dply.xrandr_get_crtc_info(crtc_id, config_ts)._data
         x = crtc['x']
         y = crtc['y']
         width = crtc['width']
         height = crtc['height']
 
-        return name, x, y, width, height
+        return name, x, y, width, height, pref_mode
 
     def __str__(self) -> str:
         dply_str = []
@@ -181,6 +196,64 @@ class DisplayConfig:
 
     def __hash__(self):
         return hash(self.displays)
+
+    def _find_mode(self, mode_id):
+        for mode in self.modes:
+            if mode['id'] == mode_id:
+                return mode
+
+        raise KeyError(f'mode {mode_id} not found')
+
+    def switch_to_preferred_modes(self) -> bool:
+        """May be called to switch all displays to their preferred modes. Returns
+        True if something changed."""
+
+        new_modes = self.preferred_modes
+        if len(new_modes) > 1:
+            # TODO: requires calculating the new screen size based on all CRTCs
+            self.log.warning('sorry, automatic mode-switching not yet supported '
+                             'with a multi-monitor configuration')
+            return False
+
+        did_change = False
+        for name, new_mode in new_modes.items():
+            crtc_id, new_mode_id = new_mode
+            if new_mode_id < 0:
+                self.log.debug('use_preferred_mode: new_mode_id unset for %s',
+                               name)
+                continue
+
+            crtc = self.dply.xrandr_get_crtc_info(crtc_id, Xlib.X.CurrentTime)._data
+            if crtc['mode'] == new_mode_id:
+                self.log.debug('use_preferred_mode: new_mode_id %d already set for %s',
+                               new_mode_id, name)
+                continue
+
+            self.log.info('switching output %s (%d) to new preferred mode %d', name,
+                          crtc_id, new_mode_id)
+
+            mode = self._find_mode(new_mode_id)
+            new_width = mode['width']
+            new_height = mode['height']
+            # Assume that this mode is being used with a virtual display and calculate
+            # fictional physical size.
+            self.root.xrandr_set_screen_size(new_width, new_height,
+                                             int(new_width / PIXELS_PER_MM),
+                                             int(new_height / PIXELS_PER_MM))
+
+            self.dply.xrandr_set_crtc_config(crtc_id,
+                                             crtc['timestamp'],
+                                             crtc['x'],
+                                             crtc['y'],
+                                             new_mode_id,
+                                             crtc['rotation'],
+                                             crtc['outputs'])
+            did_change = True
+
+        if did_change:
+            self.dply.flush()
+
+        return did_change
 
 
 # pylint: disable=too-many-instance-attributes
@@ -370,9 +443,10 @@ class Window:
 class StateStore:
     """Stores window states for all seen configurations."""
 
-    def __init__(self, dply: Xlib.display.Display):
+    def __init__(self, dply: Xlib.display.Display, switch_modes=False):
         self.dply = dply
         self.root = dply.screen().root
+        self.switch_modes = switch_modes
 
         self.log = logging.getLogger('StateStore')
 
@@ -437,7 +511,7 @@ class StateStore:
 
         return True
 
-    def poll(self, displays_changed) -> bool:
+    def poll(self, displays_changed, recheck=False) -> bool:
         """Updates stored window configurations or updates the display from stored configuration
         if the screen configuration has changed. Screen configuration is only checked if
         displays_changed` is True because the check can be slow. Returns True if screen
@@ -449,16 +523,42 @@ class StateStore:
         else:
             curr_displays = None
 
-        if curr_displays is None or curr_displays == self._current_displays:
-            if VERY_VERBOSE:
-                self.log.debug('display state unchanged: %s', curr_displays)
-            self._update_windows(curr_displays or self._current_displays)
+        def switch_and_recheck(curr_dp) -> bool:
+            if recheck or not self.switch_modes or curr_dp is None:
+                return False
+
+            try:
+                did_switch = curr_dp.switch_to_preferred_modes()
+            except Xlib.error.BadValue as exc:
+                self.log.error('failed to switch to preferred mode: %s', exc)
+                did_switch = False
+
+            if did_switch:
+                self.log.debug('forcing display recheck after mode change')
+                # Let the real WM do whatever first
+                time.sleep(SETTLE_INTERVAL / 4)
+                # Then re-check what display config we ended up with (we don't
+                # get an event notification for the mode change we did ourselves)
+                self.poll(True, recheck=True)
+                return True
+
             return False
+
+        if curr_displays is None or curr_displays == self._current_displays:
+            if VERY_VERBOSE or curr_displays is not None:
+                self.log.debug('display state unchanged: %s', curr_displays)
+            did_switch = switch_and_recheck(curr_displays)
+            # Avoid updating windows here, the WM may have moved them before
+            # we started handling the mode change.
+            if not did_switch:
+                self._update_windows(curr_displays or self._current_displays)
+            return did_switch
 
         # Display state has changed. Set new config as current and check
         # if we have a stored window configuration.
         first_run = self._current_displays is None
         self._current_displays = curr_displays
+        do_reposition = True
 
         try:
             new_config = self._stored_configs[curr_displays]
@@ -467,23 +567,26 @@ class StateStore:
                 self.log.info('display state changed: %s (no stored window configuration)',
                               curr_displays)
             self._update_windows(curr_displays)
-            return True
+            do_reposition = False
 
-        # Found stored configuration. Restore it.
-        for window in new_config:
-            if not window.should_reposition():
-                continue
+        if do_reposition:
+            # Found stored configuration. Restore it.
+            for window in new_config:
+                if not window.should_reposition():
+                    continue
 
-            try:
-                window.reposition()
-            except Xlib.error.BadDrawable as exc:
-                self.log.warning('window %r was no longer present: %s', window, exc)
-            except Exception: # pylint: disable=broad-except
-                self.log.exception('internal error repositioning window %r', window)
-        self.dply.flush()
+                try:
+                    window.reposition()
+                except Xlib.error.BadDrawable as exc:
+                    self.log.warning('window %r was no longer present: %s', window, exc)
+                except Exception: # pylint: disable=broad-except
+                    self.log.exception('internal error repositioning window %r', window)
+            self.dply.flush()
 
-        self.log.info('display state changed: %s (repositioned %d window(s))',
-                      curr_displays, len(new_config))
+            self.log.info('display state changed: %s (repositioned %d window(s))',
+                          curr_displays, len(new_config))
+
+        switch_and_recheck(curr_displays)
 
         return True
 
@@ -553,8 +656,9 @@ class EventWaiter:
         # pylint: disable=broad-except
         try:
             root = self.dply.screen().root
-            root.xrandr_select_input(Xlib.ext.randr.RRCrtcChangeNotifyMask |
-                                     Xlib.ext.randr.RROutputChangeNotifyMask)
+            mask = Xlib.ext.randr.RRCrtcChangeNotifyMask | \
+                   Xlib.ext.randr.RROutputChangeNotifyMask
+            root.xrandr_select_input(mask)
         except Exception:
             self.log.exception('xrandr_select_input failed')
             self._state = self.STATE_DESTROYED
@@ -622,6 +726,8 @@ def main(argv):
                         default=DEFAULT_POLL_INTERVAL,
                         help='Interval for polling window/screen changes '
                         '(default %(default)s seconds)')
+    parser.add_argument('-P', '--use-preferred-mode', action='store_true', default=False,
+                        help='Switch displays to their preferred modes')
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help='Verbose logging (repeat for debug logging')
     parser.add_argument('-V', '--version', action='store_true',
@@ -656,7 +762,7 @@ def main(argv):
         log.fatal('poll interval must be 1 second or more')
         return 1
 
-    store = StateStore(DISPLAY)
+    store = StateStore(DISPLAY, switch_modes=args.use_preferred_mode)
     if not store.check_wm_support():
         log.fatal('your window manager lacks required features to run this program')
         return 2
