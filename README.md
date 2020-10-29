@@ -8,6 +8,12 @@ to the positions they had before you last attached the external display.
 `xwinrestore` was inspired by the [RestoreWindows](https://github.com/gurrhack/RestoreWindows)
 program for Microsoft Windows.
 
+As a bonus feature, it also supports optional automatic screen resizing, which is useful
+with certain combinations remote desktop viewers and desktop environments. For example,
+[XFCE4 does not auto-resize the screen](https://gitlab.xfce.org/xfce/xfce4-settings/-/issues/142)
+when a SPICE viewer (`virt-viewer`) window is resized. Resizing can be enabled
+with the `-P` option.
+
 ## Usage
 
 ### Prerequisites
@@ -23,8 +29,7 @@ install the version packaged with a newer distribution.
 
 Your window manager must support at least version 1.1 of the
 [Extended Window Manager Hints](https://specifications.freedesktop.org/wm-spec/wm-spec-latest.html)
-specification. `xwinrestore` has only been tested with various version of `xfwm4`
-so far.
+specification. `xwinrestore` has so far only been tested with `xfwm4`.
 
 ### Installation
 
@@ -36,8 +41,13 @@ Run `xwinrestore.py` in the background on login. You can start it from
 `.xinitrc`, `.xsession` or similar file, or through your desktop
 environment's autostart facility.
 
-Run the program with `--help` to see command line options. If you encounter problems,
-try running the program manually with `-vv` to see debug logging.
+If you need automatic screen resizing, add the `-P` option. This is
+currently supported only in single-display configurations and is
+likely only useful for virtual (remote desktop) displays.
+
+Run the program with `--help` to see command line options. If you
+encounter problems, try running the program manually with `-vv` to see
+debug logging.
 
 ## Bug reports and patches
 
