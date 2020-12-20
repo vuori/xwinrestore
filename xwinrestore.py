@@ -319,7 +319,7 @@ class Window:
             try:
                 window = cls(dply, window_id, root=root)
                 result.append(window)
-            except Xlib.error.BadDrawable as exc:
+            except (Xlib.error.BadDrawable, Xlib.error.BadWindow) as exc:
                 log.warning('client window 0x%x was listed by window manager but not present: %s',
                             window_id, exc)
 
