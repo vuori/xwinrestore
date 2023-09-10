@@ -15,6 +15,8 @@ with certain combinations of remote desktop viewers and desktop environments. Fo
 when a SPICE viewer (`virt-viewer`) window is resized. Auto-resizing can be enabled
 with the `-P` option.
 
+**This project is suspended as of 2023, as I have switched to a tiling window manager.**
+
 ## Usage
 
 ### Prerequisites
